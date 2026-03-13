@@ -586,7 +586,10 @@ class Siglip2VisionEmbeddings(nn.Module):
 
                 # 窗口结束后，offset 推进该窗口的有效 token 数
             offset += h_eff * w_eff
-        reverse_mapping = torch.tensor(mapping, dtype=torch.long)
+        # Create on the same device as all_tokens. On GPU, CPU index tensors
+        # are implicitly transferred during indexing, but the Neuron runtime
+        # requires all operands to reside on the same device.
+        reverse_mapping = torch.tensor(mapping, dtype=torch.long, device=all_tokens.device)
 
         return all_tokens, win_meta_list, reverse_mapping
 
@@ -734,12 +737,11 @@ class Rope2DPosEmb(nn.Module):
     def extra_repr(self):
         return f"dim={self.dim}, max_height={self.max_height}, max_width={self.max_width}, theta_base={self.theta_base}"
 
-    def _precompute_freqs_cis(self, device: torch.device) -> torch.Tensor:
-        """Calculate the cis(freqs) for each position in the 2D grid.
-        Return: complex tensor of shape (max_height, max_width, dim//2) and value:
-            height axis: ret[h, w, 2*i] = cis(h * theta_base**(-4*i/dim))
-            weight axis: ret[h, w, 2*i+1] = cis(w * theta_base**(-4*i/dim))   with (i in [0, dim//4))
-            note: `cis` is a mathematical notation defined by cis x = cos x + i sin x,
+    def _precompute_freqs_cis(self, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Calculate cos/sin frequencies for each position in the 2D grid.
+        Return: tuple of (cos, sin) real tensors, each of shape (max_height, max_width, dim//2):
+            height axis: cos/sin(h * theta_base**(-4*i/dim))
+            weight axis: cos/sin(w * theta_base**(-4*i/dim))   with (i in [0, dim//4))
         """
         N = self.max_height * self.max_width
         flat_pos = torch.arange(0, N).float().to(device)
@@ -751,48 +753,30 @@ class Rope2DPosEmb(nn.Module):
         freqs = 1.0 / (self.theta_base ** (dim_range / self.dim))
         x_freqs = torch.outer(x_pos, freqs).float()  # N, C/4
         y_freqs = torch.outer(y_pos, freqs).float()  # N, C/4
-        x_cis = torch.polar(torch.ones_like(x_freqs), x_freqs)  # N, C/4
-        y_cis = torch.polar(torch.ones_like(y_freqs), y_freqs)  # N, C/4
-        # N, C/4, 2
-        freqs_cis = torch.cat(
-            [x_cis.unsqueeze(dim=-1), y_cis.unsqueeze(dim=-1)], dim=-1
-        )
+        # Interleave x and y frequencies: N, C/4, 2 -> N, C/2
+        freqs_combined = torch.stack([x_freqs, y_freqs], dim=-1).reshape(N, -1)
         # max_height, max_width, C/2
-        freqs_cis = freqs_cis.reshape(self.max_height, self.max_width, -1)
-        return freqs_cis
+        cos_freqs = torch.cos(freqs_combined).reshape(self.max_height, self.max_width, -1)
+        sin_freqs = torch.sin(freqs_combined).reshape(self.max_height, self.max_width, -1)
+        return cos_freqs, sin_freqs
 
-    def get_freqs_cis(
-        self, win_meta_list: List[Dict], device: torch.device
-    ) -> torch.Tensor:
+
+    def get_freqs_cis(self, win_meta_list: List[Dict], device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             win_meta_list (List[Dict]): window meta list
         Returns:
-            freqs_cis: tensor of shape (sum(t * height * width), dim//2)
+            tuple of (cos, sin) tensors, each of shape (1, sum(t * height * width), dim//2)
         """
         if self.freqs_cis is None:
             self.freqs_cis = self._precompute_freqs_cis(device)
 
+        cos_freqs, sin_freqs = self.freqs_cis
         # assert all xy <512
-        assert all(
-            win_meta["win_xy"][0] + win_meta["win_hw"][0] < 512
-            and win_meta["win_xy"][1] + win_meta["win_hw"][1] < 512
-            for win_meta in win_meta_list
-        )
-        freqs_cis = torch.cat(
-            [
-                self.freqs_cis[
-                    win_meta["win_xy"][0] : win_meta["win_xy"][0]
-                    + win_meta["win_hw"][0],
-                    win_meta["win_xy"][1] : win_meta["win_xy"][1]
-                    + win_meta["win_hw"][1],
-                ].reshape(-1, self.dim // 2)
-                for win_meta in win_meta_list
-            ],
-            dim=0,
-        )
-        freqs_cis = freqs_cis.unsqueeze(0)
-        return freqs_cis
+        assert all(win_meta["win_xy"][0] + win_meta["win_hw"][0] < 512 and win_meta["win_xy"][1] + win_meta["win_hw"][1] < 512 for win_meta in win_meta_list)
+        cos_out = torch.cat([cos_freqs[win_meta['win_xy'][0]:win_meta['win_xy'][0] + win_meta['win_hw'][0], win_meta['win_xy'][1]: win_meta['win_xy'][1] + win_meta['win_hw'][1]].reshape(-1, self.dim // 2) for win_meta in win_meta_list], dim=0)
+        sin_out = torch.cat([sin_freqs[win_meta['win_xy'][0]:win_meta['win_xy'][0] + win_meta['win_hw'][0], win_meta['win_xy'][1]: win_meta['win_xy'][1] + win_meta['win_hw'][1]].reshape(-1, self.dim // 2) for win_meta in win_meta_list], dim=0)
+        return cos_out.unsqueeze(0), sin_out.unsqueeze(0)
 
 
 def eager_attention_forward(
@@ -822,33 +806,43 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
-def _apply_rope_input_validation(x, freqs_cis):
-    assert x.ndim == freqs_cis.ndim + 1, (x.shape, freqs_cis.shape)
-    assert x.shape[:-2] == freqs_cis.shape[:-1], (x.shape, freqs_cis.shape)
-    assert x.shape[-1] == 2 * freqs_cis.shape[-1], (x.shape, freqs_cis.shape)
-    assert freqs_cis.dtype == torch.complex64, freqs_cis.dtype
+def _apply_rope_input_validation(x, freqs):
+    assert x.ndim == freqs.ndim + 1, (x.shape, freqs.shape)
+    assert x.shape[:-2] == freqs.shape[:-1], (x.shape, freqs.shape)
+    assert x.shape[-1] == 2 * freqs.shape[-1], (x.shape, freqs.shape)
 
 
 def apply_rope(
-    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
+    xq: torch.Tensor, xk: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Args: (The leading dimensions of all inputs should be the same)
         xq: query, tensor of shape (..., num_heads, head_dim)
         xk: key, tensor of shape (..., num_heads, head_dim)
-        freqs_cis: tensor of shape (..., head_dim/2), dtype=torch.complex64. It contains the precomputed cis(freqs) for each position in the 2D grid.
+        freqs_cos: tensor of shape (..., head_dim/2), real-valued cos of rotation angles.
+        freqs_sin: tensor of shape (..., head_dim/2), real-valued sin of rotation angles.
     Returns:
         xq_out, xk_out: tensors of shape (..., num_heads, head_dim)
     """
-    _apply_rope_input_validation(xq, freqs_cis)
-    _apply_rope_input_validation(xk, freqs_cis)
+    _apply_rope_input_validation(xq, freqs_cos)
+    _apply_rope_input_validation(xk, freqs_cos)
 
-    freqs_cis = freqs_cis.unsqueeze(-2)  # ..., 1, head_dim/2
-    # ..., num_heads, head_dim/2
-    xq_ = torch.view_as_complex(xq.float().view(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().view(*xq.shape[:-1], -1, 2))
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(-2)  # ..., num_heads, head_dim
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(-2)  # ..., num_heads, head_dim
+    freqs_cos = freqs_cos.unsqueeze(-2)  # ..., 1, head_dim/2
+    freqs_sin = freqs_sin.unsqueeze(-2)  # ..., 1, head_dim/2
+
+    # Split into pairs: (..., num_heads, head_dim) -> (..., num_heads, head_dim/2, 2)
+    xq_r = xq.float().view(*xq.shape[:-1], -1, 2)
+    xq_real, xq_imag = xq_r[..., 0], xq_r[..., 1]
+
+    xk_r = xk.float().view(*xk.shape[:-1], -1, 2)
+    xk_real, xk_imag = xk_r[..., 0], xk_r[..., 1]
+
+    # Apply rotation: (a + bi)(cos + i*sin) = (a*cos - b*sin) + (a*sin + b*cos)i
+    xq_out = torch.stack([xq_real * freqs_cos - xq_imag * freqs_sin,
+                          xq_real * freqs_sin + xq_imag * freqs_cos], dim=-1).flatten(-2)
+    xk_out = torch.stack([xk_real * freqs_cos - xk_imag * freqs_sin,
+                          xk_real * freqs_sin + xk_imag * freqs_cos], dim=-1).flatten(-2)
+
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
@@ -882,7 +876,7 @@ class Siglip2Attention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         output_attentions: Optional[bool] = False,
-        rope_freqs_cis: Optional[torch.Tensor] = None,
+        rope_freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         win_meta_list: Optional[List[Dict]] = None,
         windows_attn: Optional[bool] = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -905,7 +899,8 @@ class Siglip2Attention(nn.Module):
         ).transpose(1, 2)
 
         if self.use_rope:
-            queries, keys = apply_rope(queries, keys, rope_freqs_cis)
+            freqs_cos, freqs_sin = rope_freqs_cis
+            queries, keys = apply_rope(queries, keys, freqs_cos, freqs_sin)
 
         queries = queries.transpose(1, 2)
         keys = keys.transpose(1, 2)
@@ -1000,7 +995,7 @@ class Siglip2EncoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         output_attentions: Optional[bool] = False,
-        rope_freqs_cis: Optional[torch.Tensor] = None,
+        rope_freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         win_meta_list: Optional[List[Dict]] = None,
         windows_attn: Optional[bool] = False,
     ) -> Tuple[torch.FloatTensor]:
@@ -1454,11 +1449,11 @@ class Siglip2PreTrainedModel(PreTrainedModel):
             nn.init.xavier_uniform_(module.probe.data)
             nn.init.xavier_uniform_(module.attention.in_proj_weight.data)
             nn.init.zeros_(module.attention.in_proj_bias.data)
-        elif isinstance(module, Siglip2Model):
+        elif hasattr(module, "logit_scale") and hasattr(module, "logit_bias"):
             logit_scale_init = torch.log(torch.tensor(1.0))
             module.logit_scale.data.fill_(logit_scale_init)
             module.logit_bias.data.zero_()
-        elif isinstance(module, Siglip2ForImageClassification):
+        elif hasattr(module, "classifier") and isinstance(module.classifier, nn.Linear):
             nn.init.normal_(
                 module.classifier.weight,
                 std=self.config.vision_config.hidden_size**-0.5
